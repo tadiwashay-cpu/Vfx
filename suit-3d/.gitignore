@@ -1,0 +1,4 @@
+node_modules/
+renders/*.png
+!renders/compare_v2.png
+!renders/anim_sheet_v1.png

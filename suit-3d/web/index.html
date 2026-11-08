@@ -1,0 +1,250 @@
+<title>Ember Suit</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<!--
+  Viewer for the rigged armored suit (models/suit.glb, shipped here as base64 suit.glb.txt).
+  Clips come from the GLB. The glow ripple of the power-up runs in a shader patch on the glow
+  materials: distance from the chest emblem in BIND space (the position attribute), so the
+  ripple follows the body while it moves.
+  Test hooks (URL params): ?clip=Idle|Walk|PowerUp &t=<seconds> &paused=1 &ui=0 &view=front|side|three
+  &skeleton=1. Motion is driven by performance.now(), so a fake clock can step it.
+-->
+<style>
+  /* one-screen stage: dark single-look viewer, controls in a bottom tray */
+  :root { --bg: #07080a; --ink: #f3ece4; --muted: #a59d94; --accent: #ff7a1a; --accent-ink: #1a0d03; --panel: #121316; --btn: #1c1d21; --line: #ffffff1f; color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); font: 15px/1.4 system-ui, sans-serif; overflow: hidden; }
+  canvas { display: block; touch-action: none; }
+  .hud { position: fixed; left: max(16px, env(safe-area-inset-left, 0px)); top: calc(12px + env(safe-area-inset-top, 0px)); pointer-events: none; }
+  .hud h1 { margin: 0; font: 650 20px/1.2 system-ui, sans-serif; letter-spacing: .02em; }
+  .hud p { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
+  .tray { position: fixed; left: 0; right: 0; bottom: 0; padding-block: 10px calc(10px + env(safe-area-inset-bottom, 0px)); padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+          background: color-mix(in srgb, var(--panel) 90%, transparent); border-top: 1px solid var(--line);
+          display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; align-items: center; }
+  button { font: 600 14px system-ui; padding: 9px 14px; border-radius: 10px; border: 1px solid var(--line); background: var(--btn); color: var(--ink); cursor: pointer; }
+  button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); border-color: transparent; }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  label { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
+  input[type=range] { width: 110px; accent-color: var(--accent); }
+  .sep { width: 1px; height: 24px; background: var(--line); }
+  [hidden] { display: none !important; }
+  #loader { position: fixed; inset: 0; display: grid; place-items: center; color: var(--muted); }
+</style>
+<div id="loader">Loading suit…</div>
+<div class="hud" id="hud"><h1>Ember Suit</h1><p>Rigged &middot; 22 bones &middot; Idle / Walk / Power-up</p></div>
+<div class="tray" id="tray">
+  <button data-clip="Idle" aria-pressed="true">Idle</button>
+  <button data-clip="Walk" aria-pressed="false">Walk</button>
+  <button data-clip="PowerUp" aria-pressed="false">Power-up</button>
+  <span class="sep"></span>
+  <button id="bones" aria-pressed="false">Skeleton</button>
+  <button id="spin" aria-pressed="false">Turntable</button>
+  <label>Glow <input id="glow" type="range" min="0" max="2" step="0.05" value="1"></label>
+</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
+import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
+import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+import { ShaderPass } from "three/addons/postprocessing/ShaderPass.js";
+import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
+import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
+
+const $ = (id) => document.getElementById(id);
+const Q = new URLSearchParams(location.search);
+const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches;
+if (Q.get("ui") === "0") { $("tray").hidden = true; $("hud").hidden = true; }
+
+// ---------- renderer / scene
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: Q.has("t") });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x07080a);
+scene.fog = new THREE.Fog(0x07080a, 6, 14);
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+scene.environmentIntensity = 0.35;   // r160 ignores this; materials get envMapIntensity below
+
+const camera = new THREE.PerspectiveCamera(32, 1, 0.05, 50);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true; controls.minDistance = 1.2; controls.maxDistance = 9;
+controls.maxPolarAngle = Math.PI * 0.53;
+
+// stage: dark glossy floor, a key spot, cool rim lights, warm bounce from the emblem
+const floor = new THREE.Mesh(new THREE.CircleGeometry(6, 64),
+  new THREE.MeshStandardMaterial({ color: 0x0b0c0e, roughness: 0.82, metalness: 0.0, envMapIntensity: 0.0 }));
+floor.rotation.x = -Math.PI / 2; floor.receiveShadow = true; scene.add(floor);
+scene.add(new THREE.HemisphereLight(0x9fb4d6, 0x050505, 0.18));
+const key = new THREE.SpotLight(0xffffff, 40, 12, 0.5, 0.6, 1.6);
+key.position.set(1.6, 3.6, 2.6); key.target.position.set(0, 1, 0); key.castShadow = true;
+key.shadow.mapSize.set(2048, 2048); key.shadow.bias = -0.0004; scene.add(key, key.target);
+for (const x of [-1, 1]) {
+  const rim = new THREE.DirectionalLight(0xbcd4ff, 2.2); rim.position.set(2.2 * x, 2.4, -2.5); scene.add(rim);
+}
+const fill = new THREE.DirectionalLight(0xffffff, 0.5); fill.position.set(-2, 1.5, 3); scene.add(fill);
+const ember = new THREE.PointLight(0xff7a1a, 0.6, 1.6, 2);
+
+// ---------- glow material patch (bind-space ripple from the chest emblem)
+const GLOW_U = { uLevel: { value: 1 }, uRipple: { value: -1 }, uFlash: { value: 0 }, uUser: { value: 1 }, uTime: { value: 0 } };
+const EMBLEM = new THREE.Vector3(0, 1.415, 0.16);
+function patchGlow(mat, key) {
+  mat.onBeforeCompile = (sh) => {
+    Object.assign(sh.uniforms, GLOW_U);
+    sh.uniforms.uIsVisor = { value: key === "visor" ? 1 : 0 };
+    sh.vertexShader = sh.vertexShader
+      .replace("#include <common>", "#include <common>\nvarying vec3 vBind;")
+      .replace("#include <begin_vertex>", "#include <begin_vertex>\nvBind = position;");
+    sh.fragmentShader = sh.fragmentShader
+      .replace("#include <common>", `#include <common>
+        varying vec3 vBind; uniform float uLevel, uRipple, uFlash, uUser, uTime, uIsVisor;
+        const vec3 EMBLEM = vec3(${EMBLEM.x.toFixed(3)}, ${EMBLEM.y.toFixed(3)}, ${EMBLEM.z.toFixed(3)});`)
+      .replace("#include <emissivemap_fragment>", `#include <emissivemap_fragment>
+        float dist = distance(vBind, EMBLEM);
+        float lit = uRipple < 0.0 ? 1.0 : smoothstep(uRipple + 0.02, uRipple - 0.12, dist);   // behind the front = lit
+        float front = uRipple < 0.0 ? 0.0 : exp(-pow((dist - uRipple) / 0.06, 2.0));
+        float pulse = 0.94 + 0.06 * sin(uTime * 1.5708 - dist * 3.0);                          // slow breathing shimmer
+        float lvl = uRipple < 0.0 ? uLevel : mix(0.12, uLevel, lit);
+        totalEmissiveRadiance *= uUser * pulse * (lvl + 1.4 * front + uIsVisor * uFlash);`);
+  };
+  mat.customProgramCacheKey = () => "glow-" + key;
+  return mat;
+}
+
+// ---------- post: clamp HDR spikes, bloom, output
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+composer.addPass(new ShaderPass({
+  uniforms: { tDiffuse: { value: null } },
+  vertexShader: "varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }",
+  fragmentShader: "uniform sampler2D tDiffuse; varying vec2 vUv; void main(){ vec4 c = texture2D(tDiffuse, vUv); gl_FragColor = vec4(min(c.rgb, vec3(4.0)), c.a); }",
+}));
+const bloom = new UnrealBloomPass(new THREE.Vector2(256, 256), 0.42, 0.35, 0.92);
+if (Q.get("bloom") !== "0") composer.addPass(bloom);
+composer.addPass(new OutputPass());
+
+// ---------- load
+async function loadGlbTxt(url) {
+  const b64 = (await (await fetch(url)).text()).trim();
+  const bin = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+  return new GLTFLoader().parseAsync(bin.buffer, "");
+}
+const gltf = await loadGlbTxt("suit.glb.txt");
+const suit = gltf.scene;
+suit.traverse((o) => {
+  if (!o.isMesh) return;
+  o.castShadow = o.receiveShadow = true; o.frustumCulled = false;
+  const m = o.material; m.envMapIntensity = 0.45;
+  if (m.name === "glow" || m.name === "visor") patchGlow(m, m.name);
+});
+scene.add(suit);
+const spine2 = suit.getObjectByName("Spine2");
+ember.position.set(0, 0.06, 0.42); spine2.add(ember);
+const skel = new THREE.SkeletonHelper(suit); skel.visible = Q.get("skeleton") === "1"; scene.add(skel);
+$("loader").hidden = true;
+
+// ---------- animation
+const mixer = new THREE.AnimationMixer(suit);
+const actions = Object.fromEntries(gltf.animations.map((c) => [c.name, mixer.clipAction(c)]));
+actions.PowerUp.setLoop(THREE.LoopOnce, 1); actions.PowerUp.clampWhenFinished = true;
+let current = actions.Idle; current.play();
+let powerStart = -1;                 // ms (performance.now) when the power-up began
+let afterPower = "Idle";
+function play(name) {
+  const next = actions[name];
+  if (name === "PowerUp") {
+    afterPower = current === actions.PowerUp ? afterPower : current.getClip().name;
+    next.reset(); powerStart = performance.now();
+  } else powerStart = -1;
+  if (next !== current) { next.enabled = true; next.play(); current.crossFadeTo(next, name === "PowerUp" ? 0.15 : 0.35, false); }
+  current = next;
+  document.querySelectorAll("[data-clip]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.clip === name)));
+}
+mixer.addEventListener("finished", (e) => { if (e.action === actions.PowerUp) play(afterPower); });
+document.querySelectorAll("[data-clip]").forEach((b) => b.addEventListener("click", () => play(b.dataset.clip)));
+$("bones").addEventListener("click", (e) => { skel.visible = !skel.visible; e.currentTarget.setAttribute("aria-pressed", String(skel.visible)); });
+let spin = false;
+$("spin").addEventListener("click", (e) => { spin = !spin; e.currentTarget.setAttribute("aria-pressed", String(spin)); });
+$("glow").addEventListener("input", (e) => { GLOW_U.uUser.value = +e.target.value; });
+
+// same timeline as src/anim.js powerGlow (kept in sync by hand; pure function of ms)
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v)), k01 = (t, a, b) => clamp((t - a) / (b - a), 0, 1);
+const easeInOut = (x) => x * x * (3 - 2 * x), easeOut3 = (x) => 1 - Math.pow(1 - x, 3);
+function powerGlow(ms) {
+  if (ms < 0 || ms > 2600) return { level: 1, ripple: -1, flash: 0 };
+  const dim = 1 - 0.85 * easeInOut(k01(ms, 0, 420)), up = easeOut3(k01(ms, 480, 1250));
+  return {
+    level: ms < 480 ? dim : 0.15 + 0.85 * up + 0.35 * Math.exp(-Math.max(0, ms - 700) / 300),
+    ripple: ms < 480 ? -1 : 1.3 * easeOut3(k01(ms, 480, 1350)),
+    flash: Math.max(0, Math.sin(Math.PI * k01(ms, 480, 760))) * 0.6,
+  };
+}
+
+// ---------- camera fit (pulled back; NaN-safe on 0x0 first layouts)
+const VIEWS = { three: [0.55, 0.12], front: [0, 0.04], side: [Math.PI / 2, 0.04] };
+let lastSize = "";
+function fit(force) {
+  const w = innerWidth, h = innerHeight; if (!w || !h) return;
+  const size = w + "x" + h; if (!force && size === lastSize) return; lastSize = size;
+  renderer.setSize(w, h); composer.setSize(w, h); bloom.resolution.set(w / 2, h / 2);
+  camera.aspect = w / h;
+  const vfov = THREE.MathUtils.degToRad(camera.fov), hfov = 2 * Math.atan(Math.tan(vfov / 2) * camera.aspect);
+  const needH = 2.25, needW = 1.6;                          // the suit plus room for the glow
+  const dist = Math.max(needH / 2 / Math.tan(vfov / 2), needW / 2 / Math.tan(hfov / 2)) * 1.08;
+  if (force) {
+    const [az, el] = VIEWS[Q.get("view")] || VIEWS.three;
+    controls.target.set(0, 0.95, 0);
+    camera.position.set(Math.sin(az) * Math.cos(el) * dist, 0.95 + Math.sin(el) * dist, Math.cos(az) * Math.cos(el) * dist);
+  }
+  if (force && Q.get("cam")) {
+    const c = Q.get("cam").split(",").map(Number), t = (Q.get("target") || "0,1,0").split(",").map(Number);
+    camera.position.set(...c); controls.target.set(...t);
+  }
+  camera.updateProjectionMatrix(); controls.update();
+}
+fit(true); addEventListener("resize", () => fit(false));
+
+// ---------- prewarm: compile against the composer target so the first power-up doesn't hitch
+renderer.setRenderTarget(composer.readBuffer);
+renderer.compile(scene, camera);
+renderer.setRenderTarget(null);
+mixer.update(0); composer.render();
+
+// ---------- test hooks
+if (Q.get("clip")) play(Q.get("clip"));
+const fixedT = Q.has("t") ? +Q.get("t") : null;
+if (fixedT !== null) {
+  mixer.setTime(0); current.time = 0; mixer.update(fixedT);
+  if (Q.get("clip") === "PowerUp") powerStart = performance.now() - fixedT * 1000;
+}
+const paused = Q.get("paused") === "1" || fixedT !== null;
+
+// ---------- loop
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  if (!paused) mixer.update(reduceMotion && current === actions.Walk ? dt * 0.5 : dt);
+  const g = powerStart >= 0 ? powerGlow((fixedT !== null ? fixedT * 1000 : now - powerStart)) : { level: 1, ripple: -1, flash: 0 };
+  GLOW_U.uLevel.value = g.level; GLOW_U.uRipple.value = g.ripple; GLOW_U.uFlash.value = g.flash;
+  GLOW_U.uTime.value = now / 1000;
+  ember.intensity = 0.6 * g.level * GLOW_U.uUser.value;
+  if (spin && !paused) suit.rotation.y += dt * 0.5;
+  controls.update();
+  composer.render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+window.__viewer = { THREE, scene, camera, renderer, mixer, actions, play, GLOW_U, ready: true };
+</script>
